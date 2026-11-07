@@ -3597,6 +3597,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_REUSE"));
     add_opt(common_arg(
+        {"--sched-prefill-chunk"}, "N",
+        string_format(
+            "max prompt tokens scheduled per step while at least one slot is generating; bounds the decode\n"
+            "stall caused by long prefills (cf. vLLM long_prefill_token_threshold). 0 = fill n_batch (default: %d)",
+            params.sched_prefill_chunk
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--sched-prefill-chunk must be >= 0");
+            }
+            params.sched_prefill_chunk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SCHED_PREFILL_CHUNK"));
+    add_opt(common_arg(
+        {"--spec-max-active"}, "N",
+        string_format(
+            "start new speculative drafts only while at most N slots are generating; above that the verify\n"
+            "batch costs more than drafting saves. 0 = always draft (default: %d)",
+            params.spec_max_active
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--spec-max-active must be >= 0");
+            }
+            params.spec_max_active = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_MAX_ACTIVE"));
+    add_opt(common_arg(
         {"--metrics"},
         string_format("enable prometheus compatible metrics endpoint (default: %s)", params.endpoint_metrics ? "enabled" : "disabled"),
         [](common_params & params) {

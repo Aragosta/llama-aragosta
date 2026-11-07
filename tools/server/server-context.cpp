@@ -3453,6 +3453,25 @@ private:
         }
     }
 
+    // aragosta: prompt order = task arrival (FCFS, as vLLM), parents before children.
+    // Upstream fills in slot-index order, so a long prompt in a low slot delays later arrivals.
+    std::vector<server_slot *> prefill_order() {
+        std::vector<server_slot *> order;
+        order.reserve(slots.size());
+        for (auto & slot : slots) {
+            order.push_back(&slot);
+        }
+        auto key = [](const server_slot * s) {
+            const bool busy  = s->is_processing() && s->task;
+            const bool child = busy && s->task->is_child();
+            return std::make_tuple(!busy, child, busy ? s->task->id : 0, s->id);
+        };
+        std::stable_sort(order.begin(), order.end(), [&](const server_slot * a, const server_slot * b) {
+            return key(a) < key(b);
+        });
+        return order;
+    }
+
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
             if (slot.is_processing()) {
@@ -3853,6 +3872,13 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // aragosta: no new drafts at high concurrency (cf. vLLM disabling speculation by batch size):
+        // the verify batch grows with users x (1 + n_draft) while the per-user gain shrinks.
+        const bool spec_allow_new = params_base.spec_max_active <= 0 ||
+            std::count_if(slots.begin(), slots.end(), [](const server_slot & s) {
+                return s.state == SLOT_STATE_GENERATING;
+            }) <= params_base.spec_max_active;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -3891,7 +3917,7 @@ private:
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
-                    } else {
+                    } else if (spec_allow_new) {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
                         slot.spec_ckpt.update_pos(
@@ -3992,12 +4018,20 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // aragosta: while any slot is generating, cap this step's prompt tokens so a long prefill
+        // cannot stretch the step (and so every decoder's inter-token latency) to a full n_batch.
+        // With no decoder the cap is lifted and an idle server prefills at full width.
+        const int32_t n_batch_prompt = params_base.sched_prefill_chunk > 0 && !generating.empty()
+            ? std::min(n_batch, (int32_t) batch.size() + params_base.sched_prefill_chunk)
+            : n_batch;
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+            std::vector<server_slot *> order = prefill_order();
+            iterate(order, [&](server_slot & slot) {
+                if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -4484,7 +4518,7 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
