@@ -1,0 +1,1 @@
+{"prompt_tokens_cold": 12383, "prompt_tokens_attach": 12383, "cache_tokens_attach": 0, "ttft_ms_cold": 6584.023, "ttft_ms_attach": 6499.01, "attach_vs_cold": [128, 1.0], "reuse_vs_cold": [128, 1.0]}

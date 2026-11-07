@@ -85,7 +85,8 @@ def run_session(sid: int, a, tools: str, go: threading.Barrier, results: list):
         tm = r["timings"] or {}
         results.append({"session": sid, "turn": turn, "ttft": (st[0] - r["t0"]) if st else None,
                         "n_tok": len(st), "gaps": gaps, "t_end": st[-1] if st else r["t0"],
-                        "t0": r["t0"], "prompt_n": tm.get("prompt_n"), "cache_n": tm.get("cache_n")})
+                        "t0": r["t0"], "prompt_n": tm.get("prompt_n"), "cache_n": tm.get("cache_n"),
+                        "text": r["text"]})
         time.sleep(a.think_time)
 
 
