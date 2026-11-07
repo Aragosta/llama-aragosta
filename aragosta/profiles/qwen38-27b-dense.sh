@@ -5,6 +5,8 @@
 # -sm tensor: both GPUs work on every token (layer split runs them one after another).
 # MTP depth 3 beats 2 at 2 users (64.9 vs 59.9), ties at 1 user.
 # --slot-attach: sessions share their common prompt prefix (agents).
+# NCCL build (GGML_CUDA_NCCL, build-nccl): prefill +8% (790 -> 852 tok/s pp2048) but decode -3%
+#   (36.9 -> 35.7 tok/s, 4 reps), so this profile uses the plain build; decode is the priority.
 cd "$(dirname "$0")/../.."
 exec ./build/bin/llama-server \
   -m /home/snorkelaar/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf \
