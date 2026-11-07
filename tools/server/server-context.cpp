@@ -5184,7 +5184,17 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            // aragosta: recurrent memory can refuse the partial rollback of rejected drafts (single-use
+            // snapshot already claimed, or a state cell shared with another sequence; upstream #31656).
+            // The state is then unrecoverable for this sequence, so end this request instead of
+            // aborting the whole server.
+            if (!slot.mem.try_seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1)) {
+                SLT_ERR(slot, "speculative rollback to pos %d refused by the memory, ending the request\n", slot.prompt.tokens.pos_next());
+                send_error(slot, "speculative decoding rollback failed (recurrent state), please retry", ERROR_TYPE_SERVER);
+                slot.prompt_clear();
+                slot.release();
+                return;
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

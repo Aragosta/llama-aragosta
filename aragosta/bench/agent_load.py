@@ -78,7 +78,11 @@ def run_session(sid: int, a, tools: str, go: threading.Barrier, results: list):
     for turn in range(a.turns):
         msgs.append({"role": "user", "content": f"Turn {turn}: inspect the repo and continue. "
                      + synth_tool_output(a.tool_tokens * CHARS_PER_TOKEN, rng)})
-        r = stream_chat(a.url, msgs, a.max_tokens, {"cache_prompt": True})
+        try:
+            r = stream_chat(a.url, msgs, a.max_tokens, {"cache_prompt": True})
+        except Exception as e:  # a failed request ends the session; it is counted, not hidden
+            results.append({"session": sid, "turn": turn, "error": repr(e)})
+            return
         msgs.append({"role": "assistant", "content": r["text"] or "ok"})
         st = r["stamps"]
         gaps = [b - x for x, b in zip(st, st[1:])]
@@ -96,13 +100,15 @@ def pct(xs, p):
 
 
 def summarize(results: list) -> dict:
+    errors = [r for r in results if "error" in r]
+    results = [r for r in results if "error" not in r]
     ttft = [r["ttft"] for r in results if r["ttft"] is not None]
     gaps = [g for r in results for g in r["gaps"]]
     toks = sum(r["n_tok"] for r in results)
     wall = max(r["t_end"] for r in results) - min(r["t0"] for r in results)
     pn = sum(r["prompt_n"] or 0 for r in results)
     cn = sum(r["cache_n"] or 0 for r in results)
-    return {"requests": len(results), "wall_s": round(wall, 2), "agg_tok_s": round(toks / wall, 2),
+    return {"requests": len(results), "errors": len(errors), "wall_s": round(wall, 2), "agg_tok_s": round(toks / wall, 2),
             "ttft_p50_s": round(statistics.median(ttft), 3), "ttft_p95_s": round(pct(ttft, 95), 3),
             "gap_p95_ms": round(pct(gaps, 95) * 1e3, 1), "max_stall_s": round(max(gaps, default=0), 3),
             "prompt_tokens": pn, "cache_hit_tokens": cn,

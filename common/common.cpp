@@ -1664,6 +1664,13 @@ void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, lla
     }
 }
 
+bool common_memory::try_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, p0, p1)) {
+        return false;
+    }
+    return ctx_dft == nullptr || llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, p0, p1);
+}
+
 void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
     common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
     if (ctx_dft) {
