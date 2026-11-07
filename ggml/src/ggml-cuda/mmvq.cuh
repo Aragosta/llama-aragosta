@@ -1,6 +1,7 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+#define MMVQ_MMID_MAX_BATCH_SIZE 32 // aragosta: max. tokens for the MUL_MAT_ID MMVQ kernel (tiled by 8 over gridDim.z)
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 

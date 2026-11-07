@@ -3,7 +3,9 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -281,8 +283,61 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
     }
 }
 
+// aragosta: GGML_CUDA_MMVQ_MAX=N sets the MMVQ -> MMQ crossover at runtime (0 <= N <= MMVQ_MAX_BATCH_SIZE):
+// Batches larger than N are routed to MMQ. N=0 forces MMQ for every batch size; it exists for
+// aragosta/tools/tune_mmq_crossover.py, which A/B-times both kernels to derive per-quant tables.
+// it overrides the dense table and caps the MUL_MAT_ID table (which cannot exceed the compiled limit).
+static int ggml_cuda_mmvq_env_max() {
+    static const int value = [] {
+        const char * s = getenv("GGML_CUDA_MMVQ_MAX");
+        if (s == nullptr || *s == '\0') {
+            return -1; // unset
+        }
+        char * end = nullptr;
+        const long v = strtol(s, &end, 10);
+        if (*end != '\0' || v < 0 || v > MMVQ_MMID_MAX_BATCH_SIZE) {
+            GGML_LOG_WARN("%s: ignoring invalid GGML_CUDA_MMVQ_MAX='%s' (expected 0..%d)\n", __func__, s, MMVQ_MMID_MAX_BATCH_SIZE);
+            return -1;
+        }
+        return (int) v;
+    }();
+    return value;
+}
+
+static int get_mmvq_mmid_max_batch_table(ggml_type type, int cc);
+
+static int ggml_cuda_mmvq_mmid_ext_sm86(ggml_type type) {
+    // min over the up (512x2048) and down (2048x512) expert shapes, results/crossover_3060_moe32.json
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_K:   return 16;
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:   return 11;
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_XS: return 9;
+        default:               return MMVQ_MAX_BATCH_SIZE;
+    }
+}
+
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    const int table = get_mmvq_mmid_max_batch_table(type, cc);
+    const int env   = ggml_cuda_mmvq_env_max();
+    if (table < MMVQ_MAX_BATCH_SIZE) {
+        // the device kernel is compiled for <= table tokens per block, so the token tiling below does not apply
+        return env >= 0 ? std::min(table, env) : table;
+    }
+    if (env >= 0) {
+        return env;
+    }
+    // aragosta: tuned on RTX 3060 (GA106) with tune_mmq_crossover.py --nmax 32 on Qwen3-MoE expert shapes
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X) {
+        return ggml_cuda_mmvq_mmid_ext_sm86(type);
+    }
+    return table;
+}
+
+static int get_mmvq_mmid_max_batch_table(ggml_type type, int cc) {
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         cc = ggml_cuda_highest_compiled_arch(cc);
@@ -316,7 +371,18 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+static bool ggml_cuda_should_use_mmvq_table(enum ggml_type type, int cc, int64_t ne11);
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+    const int env = ggml_cuda_mmvq_env_max();
+    if (env >= 0 && ggml_is_quantized(type)) {
+        // explicit override of the per-arch table, clamped to the dense kernel's compiled limit
+        return ne11 <= std::min(env, (int) MMVQ_MAX_BATCH_SIZE);
+    }
+    return ggml_cuda_should_use_mmvq_table(type, cc, ne11);
+}
+
+static bool ggml_cuda_should_use_mmvq_table(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
@@ -362,6 +428,23 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
                 return ne11 <= 1;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X) {
+        // aragosta: tuned on RTX 3060 12GB (GA106, 360 GB/s), 4096x4096 weights, with
+        // aragosta/tools/tune_mmq_crossover.py. Low bandwidth relative to int8 MMA throughput lets
+        // MMQ win early on K-quants (MMVQ is 46% slower than MMQ for q4_K at n=8).
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+                return ne11 <= 4;
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_MXFP4:
+                return ne11 <= 6;
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
@@ -929,7 +1012,7 @@ static __global__ void mul_mat_vec_q_moe(
         }
     }
 
-    const uint32_t token_idx   = threadIdx.y;
+    const uint32_t token_idx   = blockIdx.z*blockDim.y + threadIdx.y; // aragosta: tokens tiled over gridDim.z
     const int      row0        = c_rows_per_block*blockIdx.x;
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
@@ -1087,8 +1170,12 @@ static void mul_mat_vec_q_moe_launch(
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
-    const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
-    const dim3 block_dims(warp_size, ncols_dst);
+    // aragosta: at most MMVQ_MAX_BATCH_SIZE tokens (warps) per block, matching __launch_bounds__;
+    // larger batches are tiled over gridDim.z. Each warp is independent, so this is exact.
+    const uint32_t tokens_per_block = std::min<uint32_t>(ncols_dst, MMVQ_MAX_BATCH_SIZE);
+    const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr),
+                          (ncols_dst + tokens_per_block - 1) / tokens_per_block);
+    const dim3 block_dims(warp_size, tokens_per_block);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
@@ -1120,7 +1207,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(ncols_dst <= (ids ? MMVQ_MMID_MAX_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE));
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
@@ -1473,7 +1560,7 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(!ids || ne12 <= MMVQ_MMID_MAX_BATCH_SIZE);
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
