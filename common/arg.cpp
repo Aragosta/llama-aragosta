@@ -3625,6 +3625,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_MAX_ACTIVE"));
     add_opt(common_arg(
+        {"--slot-attach"},
+        "let a new task take the longest shared prompt prefix from any other slot (running or idle) by\n"
+        "sharing its KV cells; hybrid models attach at checkpoints. requires --kv-unified, turns off\n"
+        "context shift and --cache-reuse (default: disabled)",
+        [](common_params & params) {
+            params.slot_attach = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_ATTACH"));
+    add_opt(common_arg(
         {"--metrics"},
         string_format("enable prometheus compatible metrics endpoint (default: %s)", params.endpoint_metrics ? "enabled" : "disabled"),
         [](common_params & params) {

@@ -338,6 +338,10 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // aragosta: prompt position where this task diverges from the best-matching cached prompt;
+    // hybrid models checkpoint there so later sessions can attach exactly at it. -1 = none
+    int32_t n_ckpt_divergence = -1;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -1473,6 +1477,21 @@ private:
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+
+        if (params_base.slot_attach) {
+            // shared cells have one position for all sequences, so anything that shifts cells breaks them
+            const char * reason = !params_base.kv_unified          ? "requires --kv-unified" :
+                                  params_base.n_cache_reuse > 0    ? "is incompatible with --cache-reuse" :
+                                  !params_base.lora_adapters.empty() ? "is incompatible with LoRA adapters" :
+                                  n_swa > 0                        ? "does not support SWA models" : nullptr;
+            if (reason) {
+                SRV_WRN("--slot-attach %s, disabling it\n", reason);
+                params_base.slot_attach = false;
+            } else if (params_base.ctx_shift) {
+                SRV_WRN("%s", "--slot-attach: disabling context shift (it moves shared cells)\n");
+                params_base.ctx_shift = false;
+            }
+        }
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -1901,9 +1920,80 @@ private:
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
+
+            if (params_base.slot_attach && !ret->is_processing()) {
+                slot_attach(*ret, task);
+            }
         }
 
         return ret;
+    }
+
+    // aragosta: number of prompt tokens a slot's cache lets the task skip. Hybrid/recurrent memory can
+    // only resume from a checkpoint, so there it is the newest checkpoint inside the common prefix.
+    size_t slot_reusable(const server_slot & s, const server_tokens & tokens, size_t & lcp) const {
+        lcp = s.prompt.tokens.get_common_prefix(tokens);
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+            return lcp;
+        }
+        size_t best = 0;
+        for (const auto & ckpt : s.prompt.checkpoints) {
+            if ((size_t) ckpt->n_tokens <= lcp) {
+                best = std::max(best, (size_t) ckpt->n_tokens);
+            }
+        }
+        return best;
+    }
+
+    void slot_attach(server_slot & dst, const server_task & task) {
+        dst.n_ckpt_divergence = -1;
+
+        if (task.is_stateless() || task.tokens.has_mtmd || task.type != SERVER_TASK_TYPE_COMPLETION) {
+            return;
+        }
+
+        // ponytail: linear LCP scan over slots, O(n_slots * prompt); a block-hash index replaces it if -np grows large
+        size_t lcp_own = 0;
+        const size_t own = dst.prompt.tokens.empty() ? 0 : slot_reusable(dst, task.tokens, lcp_own);
+
+        constexpr size_t min_gain = 64; // below this the copy is not worth the cache churn
+
+        server_slot * donor = nullptr;
+        size_t best    = own;
+        size_t lcp_max = lcp_own;
+        for (auto & s : slots) {
+            // a slot that was just assigned has not reconciled its cache with its KV cells yet
+            if (&s == &dst || s.prompt.tokens.empty() || s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_WAIT_OTHER) {
+                continue;
+            }
+            size_t lcp = 0;
+            const size_t r = slot_reusable(s, task.tokens, lcp);
+            lcp_max = std::max(lcp_max, lcp);
+            if (r >= best + min_gain) {
+                best  = r;
+                donor = &s;
+            }
+        }
+
+        // checkpoint where this prompt leaves the best cached one, unless a checkpoint is already there
+        if (lcp_max > best && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.n_ctx_checkpoints > 0 &&
+            lcp_max < (size_t) task.n_tokens()) {
+            dst.n_ckpt_divergence = (int32_t) lcp_max;
+        }
+
+        if (donor == nullptr) {
+            return;
+        }
+
+        // keep what dst had: the attach overwrites its sequence
+        if (prompt_cache && dst.prompt.n_tokens() > 0 && dst.prompt_save(*prompt_cache)) {
+            prompt_cache->update();
+        }
+
+        SLT_INF(dst, "attaching to slot %d: reusable %zu -> %zu tokens (common prefix %zu, prompt %d)\n",
+                donor->id, own, best, lcp_max, task.n_tokens());
+
+        donor->copy_prompt_to(dst);
     }
 
     // return true if at least one slot has been cleared
@@ -3089,7 +3179,7 @@ private:
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (params_base.kv_unified && !params_base.slot_attach) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
@@ -4556,6 +4646,11 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        // aragosta: end the batch at the divergence point, the next batch checkpoints there
+                        if (do_checkpoint && slot.prompt.n_tokens() == slot.n_ckpt_divergence) {
+                            break;
+                        }
+
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
@@ -4597,6 +4692,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_divergence        = n_tokens_start == slot.n_ckpt_divergence;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -4614,7 +4710,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_divergence) {
                             do_checkpoint = false;
                         }
                     }
@@ -4634,7 +4730,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_divergence ||
                             n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
