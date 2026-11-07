@@ -1,0 +1,1 @@
+{"requests": 12, "wall_s": 57.46, "agg_tok_s": 53.36, "ttft_p50_s": 0.797, "ttft_p95_s": 12.722, "gap_p95_ms": 173.0, "max_stall_s": 0.225, "prompt_tokens": 44794, "cache_hit_tokens": 81236, "cache_hit_pct": 64.5, "label": "sched-256", "sessions": 4, "stagger": 4.0, "max_tokens": 256, "turns": 3, "prefix_tokens": 12000}

@@ -320,3 +320,8 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# aragosta: serving-oriented additions (see aragosta/README.md)
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/aragosta/CMakeLists.txt)
+    add_subdirectory(aragosta)
+endif()
