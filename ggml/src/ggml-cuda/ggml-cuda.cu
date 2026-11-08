@@ -1123,10 +1123,6 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
-    // hybrid mode: tensors below this many bytes use the internal kernel AllReduce (lower latency, decode),
-    // the rest NCCL (higher bandwidth, prefill)
-    size_t                      hybrid_min = 0;
-
     // Number of ranks in the communicator when each rank is a separate process. Zero unless
     // comm_init_rank created this context.
     int                         world_size = 0;
@@ -1298,16 +1294,6 @@ static bool ggml_backend_cuda_comm_try_allreduce_internal(
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
 }
 
-#ifdef GGML_USE_NCCL
-static bool ggml_backend_cuda_comm_try_allreduce_hybrid(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    if (ggml_nbytes(tensors[0]) < comm_ctx->hybrid_min && ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
-        return true;
-    }
-    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
-}
-#endif // GGML_USE_NCCL
-
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
         ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
     return false;
@@ -1344,7 +1330,7 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
 
 static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
-    const bool required = env && (std::string(env) == "nccl" || std::string(env) == "hybrid");
+    const bool required = env && (std::string(env) == "nccl");
 #ifdef GGML_USE_NCCL
     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
     const ggml_cuda_device_info & info = ggml_cuda_info();
@@ -1419,19 +1405,6 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         std::string env_str(env);
         if (env_str == "nccl") {
             ggml_backend_cuda_comm_init_nccl(ret);
-        } else if (env_str == "hybrid") {
-            ggml_backend_cuda_comm_init_nccl(ret);
-#ifdef GGML_USE_NCCL
-            ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
-            if (!ret->ar_pipeline) {
-                (void) cudaGetLastError();
-                GGML_ABORT("hybrid AllReduce: internal pipeline init failed");
-            }
-            const char * min_env = getenv("GGML_CUDA_AR_NCCL_MIN");
-            ret->hybrid_min = min_env ? strtoull(min_env, nullptr, 10) : 1024 * 1024;
-            ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_hybrid;
-            GGML_LOG_INFO("hybrid AllReduce: internal below %zu bytes, NCCL above\n", ret->hybrid_min);
-#endif // GGML_USE_NCCL
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
         } else if (env_str == "none") {

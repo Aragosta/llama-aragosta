@@ -16,18 +16,10 @@ AllReduce goes through host shared memory. Decode is ~29 ms/token against ~21 ms
 so ~8 ms/token is communication and launch latency. Removing it needs fewer or overlapped AllReduces
 inside `ggml-backend-meta.cpp`, not NCCL settings. `nsys` cannot import reports on this host (importer missing).
 
-## Hybrid AllReduce (`GGML_CUDA_ALLREDUCE=hybrid`, opt-in, NOT safe)
+## AllReduce
 
-Reverted as default: two crashes in 3 runs, kernel log `NVRM: Xid 109, CTX SWITCH TIMEOUT` on GPU1 at the same times.
-The internal kernels busy-wait on the peer GPU and the GPU cannot preempt them. NCCL-only ran every test clean.
-
-Internal kernel AllReduce for messages under 1 MiB (decode, MTP verify), NCCL above (prefill). The internal
-crash was in its copy-engine path (messages of 1 MiB and up), which hybrid never uses.
-
-| Mode | pp2048 | tg128 |
-|---|---|---|
-| nccl | 843 | 34.7 |
-| hybrid | 844 | 35.8 (+3.3%) |
+Tried and removed: a hybrid (internal kernels below 1 MiB, NCCL above) gave decode 35.8 vs 34.7 tok/s but crashed two of
+three runs (`Xid 109 CTX SWITCH TIMEOUT`, `unspecified launch failure`); the internal kernels busy-wait on the peer GPU.
 
 Ceiling check (AllReduce skipped, wrong output, timing only): tg 37.9, pp 1199. So AllReduce costs ~6% of decode
 but ~30% of prefill; prefill is limited by host-memory copy bandwidth (10 MB per AllReduce, 128 per ubatch).

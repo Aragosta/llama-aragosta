@@ -1,6 +1,7 @@
 #!/bin/bash
 # Qwen3.8-27B Q4_K_M, dense, fully in VRAM on 2x RTX 3060 12GB. This is the live profile.
-# -sm tensor + hybrid AllReduce (internal kernels for decode, NCCL for prefill; fails fast without NCCL). 844 pp2048 / 35.8 tg128.
+# -sm tensor + native NCCL AllReduce (fails fast without NCCL; the internal AllReduce kernels spin-wait and
+#   caused Xid 109 CTX SWITCH TIMEOUT crashes). 844 pp2048 / 34.7 tg128 tok/s single stream.
 #   pipeline crashed with CUDA launch failures). 844 pp2048 / 34.7 tg128 tok/s single stream.
 #   NCCL env knobs (PROTO/ALGO/NTHREADS/BUFFSIZE) were swept: none beat the defaults. The two
 #   3060s have no GPU P2P, so NCCL moves data through host shared memory.
@@ -15,7 +16,7 @@
 cd "$(dirname "$0")/../.."
 MODEL=${MODEL:-/home/snorkelaar/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf}
 export LD_LIBRARY_PATH="${NCCL_LIB:-/home/snorkelaar/nccl/x/nvidia/nccl/lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export GGML_CUDA_ALLREDUCE=${AR_MODE:-nccl}
+export GGML_CUDA_ALLREDUCE=nccl
 if ! ldd ./build-nccl/bin/libggml-cuda.so.0 | grep -q 'libnccl.so.2 => /'; then
   echo 'NCCL-linked CUDA backend required: see aragosta/README.md (Build)' >&2
   exit 1

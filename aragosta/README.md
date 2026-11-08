@@ -15,7 +15,7 @@ based on upstream `f7591a6a0` (2026-11-07). Everything is opt-in; without the fl
 | Speculation | No new drafts while more than N slots generate (only useful for `-np` > 3) | `--spec-max-active N` | `update_slots()` |
 | Speculation | A refused recurrent-state rollback ends the request instead of aborting the server | always | `server-context.cpp` |
 | CUDA | sm86 MMVQ->MMQ crossover table, MoE MMVQ up to 16 tokens | `GGML_CUDA_MMVQ_MAX=0..32` | `ggml-cuda/mmvq.cu` |
-| CUDA | `GGML_CUDA_ALLREDUCE=nccl` (profile default) fails startup instead of silently using the internal AllReduce. `hybrid` (internal below 1 MiB, NCCL above) is +3% decode but **unsafe**: the internal kernels spin-wait and caused Xid 109 CTX SWITCH TIMEOUT / `unspecified launch failure` | env | `ggml-cuda.cu` |
+| CUDA | `GGML_CUDA_ALLREDUCE=nccl` makes NCCL mandatory: startup fails instead of silently using the internal AllReduce, whose spin-wait kernels crash these GPUs (Xid 109) | env | `ggml-cuda.cu` |
 | Memory | Prefix anchors are attention-only sequences (`n_seq_rs`): no recurrent-state cells or rollback snapshots, so 3 anchors cost no extra VRAM and 100k context fits. Their recurrent state comes from host checkpoints on attach | always with anchors | `llama-memory-hybrid.cpp`, `slot_attach()` |
 
 ## Run it
