@@ -1329,10 +1329,15 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
 }
 
 static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
+    const char * env = getenv("GGML_CUDA_ALLREDUCE");
+    const bool required = env && std::string(env) == "nccl";
 #ifdef GGML_USE_NCCL
     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
     const ggml_cuda_device_info & info = ggml_cuda_info();
     if (info.device_count > info.physical_device_count) {
+        if (required) {
+            GGML_ABORT("NCCL AllReduce requires one physical GPU per rank");
+        }
         GGML_LOG_WARN("NCCL disabled: virtual devices in use; "
                       "falling back to internal AllReduce\n");
         ggml_backend_cuda_comm_init_internal(ret);
@@ -1343,20 +1348,30 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ret->comms.resize(n);
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
+        GGML_LOG_INFO("NCCL AllReduce active on %zu CUDA devices\n", n);
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
         return;
     }
 
     ret->comms.clear();
+    if (required) {
+        GGML_ABORT("NCCL AllReduce initialization failed: %s", ncclGetErrorString(rc));
+    }
     GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
                   ncclGetErrorString(rc));
 #else // GGML_USE_NCCL
 #ifndef GGML_USE_HIP
+    if (required) {
+        GGML_ABORT("NCCL AllReduce was required but is not compiled in");
+    }
     GGML_LOG_WARN("NCCL not compiled in; falling back to internal AllReduce.  "
                   "Recompile with -DGGML_CUDA_NCCL=ON for best multi-GPU performance.\n");
 #endif // !GGML_USE_HIP
 #endif // GGML_USE_NCCL
 
+    if (required) {
+        GGML_ABORT("NCCL AllReduce was required but could not be initialized");
+    }
     ggml_backend_cuda_comm_init_internal(ret);
 }
 

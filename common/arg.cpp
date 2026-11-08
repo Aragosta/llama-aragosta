@@ -3625,6 +3625,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_MAX_ACTIVE"));
     add_opt(common_arg(
+        {"--prefix-anchors"}, "N",
+        string_format("persistent shared-prefix KV entries kept beyond the slots, e.g. one per agent/sub-agent system prompt (default: %d)", params.prefix_anchors),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--prefix-anchors must be >= 0");
+            }
+            params.prefix_anchors = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFIX_ANCHORS"));
+    add_opt(common_arg(
         {"--slot-attach"},
         "let a new task take the longest shared prompt prefix from any other slot (running or idle) by\n"
         "sharing its KV cells; hybrid models attach at checkpoints. requires --kv-unified, turns off\n"

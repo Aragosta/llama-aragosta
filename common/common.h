@@ -638,6 +638,7 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     int32_t sched_prefill_chunk = 0;     // aragosta: max prompt tokens per step while any slot decodes; 0 = off
     int32_t spec_max_active     = 0;     // aragosta: start no new drafts while more than N slots generate; 0 = off
+    int32_t prefix_anchors      = 3;     // aragosta: persistent prefix KV entries kept beyond the slots (--slot-attach)
     bool    slot_attach         = false; // aragosta: share prompt prefixes across slots via seq_cp (unified KV)
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task

@@ -1110,6 +1110,15 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    struct prefix_entry {
+        server_prompt prompt;
+        llama_seq_id id;
+        int64_t last_used = 0;
+    };
+    // Each entry owns KV independently of the request that produced it.
+    std::vector<prefix_entry> prefixes;
+    common_memory prefix_memory;
+
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
@@ -1140,6 +1149,12 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (ctx_tgt) {
+            for (const auto & entry : prefixes) {
+                prefix_memory.seq_rm(entry.id, -1, -1);
+            }
+        }
+        prefixes.clear();
         spec.reset();
         spec_init.reset();
 
@@ -1476,6 +1491,8 @@ private:
 
         slots.clear();
 
+        prefixes.clear();
+
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
 
         if (params_base.slot_attach) {
@@ -1536,6 +1553,15 @@ private:
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
+        }
+
+        if (params_base.slot_attach && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO &&
+            (!ctx_dft || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO)) {
+            const int n_seq_max = ctx_dft ? std::min(llama_n_seq_max(ctx_tgt), llama_n_seq_max(ctx_dft)) : llama_n_seq_max(ctx_tgt);
+            prefix_memory.init(ctx_tgt, ctx_dft);
+            for (int id = params_base.n_parallel; id < n_seq_max; ++id) {
+                prefixes.push_back({{}, id});
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -1931,13 +1957,13 @@ private:
 
     // aragosta: number of prompt tokens a slot's cache lets the task skip. Hybrid/recurrent memory can
     // only resume from a checkpoint, so there it is the newest checkpoint inside the common prefix.
-    size_t slot_reusable(const server_slot & s, const server_tokens & tokens, size_t & lcp) const {
-        lcp = s.prompt.tokens.get_common_prefix(tokens);
+    size_t prompt_reusable(const server_prompt & prompt, const server_tokens & tokens, size_t & lcp) const {
+        lcp = prompt.tokens.get_common_prefix(tokens);
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
             return lcp;
         }
         size_t best = 0;
-        for (const auto & ckpt : s.prompt.checkpoints) {
+        for (const auto & ckpt : prompt.checkpoints) {
             if ((size_t) ckpt->n_tokens <= lcp) {
                 best = std::max(best, (size_t) ckpt->n_tokens);
             }
@@ -1954,7 +1980,7 @@ private:
 
         // ponytail: linear LCP scan over slots, O(n_slots * prompt); a block-hash index replaces it if -np grows large
         size_t lcp_own = 0;
-        const size_t own = dst.prompt.tokens.empty() ? 0 : slot_reusable(dst, task.tokens, lcp_own);
+        const size_t own = dst.prompt.tokens.empty() ? 0 : prompt_reusable(dst.prompt, task.tokens, lcp_own);
 
         constexpr size_t min_gain = 64; // below this the copy is not worth the cache churn
 
@@ -1967,11 +1993,26 @@ private:
                 continue;
             }
             size_t lcp = 0;
-            const size_t r = slot_reusable(s, task.tokens, lcp);
+            const size_t r = prompt_reusable(s.prompt, task.tokens, lcp);
             lcp_max = std::max(lcp_max, lcp);
             if (r >= best + min_gain) {
                 best  = r;
                 donor = &s;
+            }
+        }
+
+        prefix_entry * entry = nullptr;
+        for (auto & candidate : prefixes) {
+            if (candidate.prompt.tokens.empty()) {
+                continue;
+            }
+            size_t lcp = 0;
+            const size_t reusable = prompt_reusable(candidate.prompt, task.tokens, lcp);
+            lcp_max = std::max(lcp_max, lcp);
+            if (reusable >= best + min_gain) {
+                best = reusable;
+                entry = &candidate;
+                donor = nullptr;
             }
         }
 
@@ -1981,7 +2022,7 @@ private:
             dst.n_ckpt_divergence = (int32_t) lcp_max;
         }
 
-        if (donor == nullptr) {
+        if (donor == nullptr && entry == nullptr) {
             return;
         }
 
@@ -1990,10 +2031,54 @@ private:
             prompt_cache->update();
         }
 
-        SLT_INF(dst, "attaching to slot %d: reusable %zu -> %zu tokens (common prefix %zu, prompt %d)\n",
-                donor->id, own, best, lcp_max, task.n_tokens());
+        if (entry) {
+            SLT_INF(dst, "attaching to persistent prefix %d: reusable %zu -> %zu tokens (prompt %d)\n",
+                    entry->id, own, best, task.n_tokens());
+            dst.mem.seq_rm(dst.id, -1, -1);
+            prefix_memory.seq_cp(entry->id, dst.id, -1, -1);
+            dst.prompt = entry->prompt.clone();
+            entry->last_used = ggml_time_us();
+        } else {
+            SLT_INF(dst, "attaching to slot %d: reusable %zu -> %zu tokens (common prefix %zu, prompt %d)\n",
+                    donor->id, own, best, lcp_max, task.n_tokens());
+            donor->copy_prompt_to(dst);
+        }
+    }
 
-        donor->copy_prompt_to(dst);
+    void prefix_commit(const server_slot & slot) {
+        if (prefixes.empty() || !slot.task || slot.task->is_stateless() || slot.task->tokens.has_mtmd ||
+            slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.prompt.tokens.empty()) {
+            return;
+        }
+        // an anchor that already covers this prompt is enough; one that is a prefix of it (previous turn
+        // of the same agent) is extended in place instead of taking a second anchor
+        const size_t n = slot.prompt.tokens.size();
+        prefix_entry * entry = nullptr;
+        for (auto & candidate : prefixes) {
+            const size_t m   = candidate.prompt.tokens.size();
+            const size_t lcp = m ? candidate.prompt.tokens.get_common_prefix(slot.prompt.tokens) : 0;
+            if (m >= n && lcp == n) {
+                candidate.last_used = ggml_time_us();
+                return;
+            }
+            if (m > 0 && lcp == m) {
+                entry = &candidate;
+                break;
+            }
+            if (m == 0 && !entry) {
+                entry = &candidate;
+            }
+        }
+        if (!entry) {
+            entry = &*std::min_element(prefixes.begin(), prefixes.end(), [](const auto & a, const auto & b) {
+                return a.last_used < b.last_used;
+            });
+        }
+        // Commit only a target-computed prompt; generated tokens and unprocessed batch entries are excluded.
+        prefix_memory.seq_rm(entry->id, -1, -1);
+        prefix_memory.seq_cp(slot.id, entry->id, -1, -1);
+        entry->prompt = slot.prompt.clone();
+        entry->last_used = ggml_time_us();
     }
 
     // return true if at least one slot has been cleared
@@ -2006,6 +2091,16 @@ private:
 
         if (!params_base.kv_unified) {
             return res;
+        }
+
+        auto it = std::min_element(prefixes.begin(), prefixes.end(), [](const auto & a, const auto & b) {
+            return (a.prompt.tokens.empty() ? INT64_MAX : a.last_used) < (b.prompt.tokens.empty() ? INT64_MAX : b.last_used);
+        });
+        if (it != prefixes.end() && !it->prompt.tokens.empty()) {
+            SRV_WRN("purging persistent prefix %d with %zu tokens\n", it->id, it->prompt.tokens.size());
+            prefix_memory.seq_rm(it->id, -1, -1);
+            it->prompt.clear();
+            return true;
         }
 
         for (auto & slot : slots) {
@@ -4916,6 +5011,14 @@ private:
 
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
+            }
+        }
+
+        if (ret == 0) {
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_DONE_PROMPT && slot.i_batch >= off && slot.i_batch < off + batch.view.size()) {
+                    prefix_commit(slot);
+                }
             }
         }
 

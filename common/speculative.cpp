@@ -291,7 +291,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             throw std::runtime_error("draft model vocab type must match target model to use speculation");
         }
 
-        if (n_seq != llama_n_seq_max(ctx_dft)) {
+        if (n_seq > llama_n_seq_max(ctx_dft)) {
             SPC_ERR("n_seq mismatch: %d != %d\n", n_seq, llama_n_seq_max(ctx_dft));
 
             throw std::runtime_error("the draft model number of sequences is incompatible with the speculative n_seq");
@@ -2736,7 +2736,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
-    result.n_outputs_max = params.n_parallel;
+    result.n_outputs_max = common_context_params_to_llama(result).n_seq_max;
     result.n_outputs_max_per_seq = 1;
 
     if (params_spec.n_ubatch > 0) {
