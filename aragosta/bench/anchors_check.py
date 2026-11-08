@@ -31,6 +31,7 @@ for i, (c, w) in enumerate(zip(cold, warm)):
     hit = (w[0] or 0) > 0.9 * ((w[0] or 0) + (w[1] or 0))
     same = c[3] == w[3]
     ok &= hit and same
+    if not same: print(repr(c[3]), repr(w[3]))
     print(json.dumps({"agent": i, "cold_ttft": round(c[2], 2), "warm_ttft": round(w[2], 2),
                       "warm_cache_n": w[0], "warm_prompt_n": w[1], "hit": hit, "same_output": same}))
 print("PASS" if ok else "FAIL")

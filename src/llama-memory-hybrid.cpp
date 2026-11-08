@@ -58,12 +58,13 @@ llama_memory_hybrid::llama_memory_hybrid(
         type_s,
         offload,
         rs_size,
-        n_seq_max,
+        n_seq_max < rs_size ? n_seq_max : rs_size,
         n_rs_seq,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    )),
+    n_seq_rs(rs_size < n_seq_max ? rs_size : n_seq_max) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -142,6 +143,9 @@ void llama_memory_hybrid::clear(bool data) {
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (attn_only(seq_id)) {
+        return mem_attn->seq_rm(seq_id, p0, p1);
+    }
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
@@ -152,30 +156,46 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
-    mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    // an attention-only sequence (prefix anchor) has no recurrent state to copy from or to; the server
+    // restores the recurrent state of the receiving slot from a host-side checkpoint
+    if (!attn_only(seq_id_src) && !attn_only(seq_id_dst)) {
+        mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
-    mem_recr->seq_keep(seq_id);
+    if (!attn_only(seq_id)) {
+        mem_recr->seq_keep(seq_id);
+    }
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     mem_attn->seq_add(seq_id, p0, p1, shift);
-    mem_recr->seq_add(seq_id, p0, p1, shift);
+    if (!attn_only(seq_id)) {
+        mem_recr->seq_add(seq_id, p0, p1, shift);
+    }
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     mem_attn->seq_div(seq_id, p0, p1, d);
-    mem_recr->seq_div(seq_id, p0, p1, d);
+    if (!attn_only(seq_id)) {
+        mem_recr->seq_div(seq_id, p0, p1, d);
+    }
 }
 
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
+    if (attn_only(seq_id)) {
+        return mem_attn->seq_pos_min(seq_id);
+    }
     // the min of the total cache is the max of the two caches' min values
     return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));
 }
 
 llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
+    if (attn_only(seq_id)) {
+        return mem_attn->seq_pos_max(seq_id);
+    }
     // the max of the total cache is the min of the two caches' max values
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
@@ -190,7 +210,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
-    mem_recr->state_write(io, seq_id, flags);
+    if (!attn_only(seq_id)) {
+        mem_recr->state_write(io, seq_id, flags);
+    }
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {

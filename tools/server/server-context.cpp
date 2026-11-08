@@ -2038,6 +2038,41 @@ private:
             prefix_memory.seq_cp(entry->id, dst.id, -1, -1);
             dst.prompt = entry->prompt.clone();
             entry->last_used = ggml_time_us();
+
+            // Anchors hold attention KV only (no recurrent cell, see llama_memory_hybrid::attn_only), so the
+            // slot's recurrent state comes from the newest host checkpoint inside the shared prefix.
+            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                const size_t lcp = dst.prompt.tokens.get_common_prefix(task.tokens);
+                std::shared_ptr<const common_prompt_checkpoint> best;
+                for (const auto & c : dst.prompt.checkpoints) {
+                    if ((size_t) c->n_tokens <= lcp && (!best || c->n_tokens > best->n_tokens)) {
+                        best = c;
+                    }
+                }
+                bool ok = false;
+                if (best) {
+                    const auto & c = *best;
+                    ok = c.load_tgt(ctx_tgt, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
+                         c.load_dft(ctx_dft, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (ok) {
+                        common_speculative_set_state(spec.get(), dst.id, c.data_spec);
+                        const llama_pos pos_next = std::max(c.pos_min + 1, c.pos_max);
+                        dst.mem.seq_rm(dst.id, pos_next, -1);
+                        dst.prompt.tokens.keep_first(c.n_tokens);
+                        for (auto it = dst.prompt.checkpoints.begin(); it != dst.prompt.checkpoints.end();) {
+                            if ((*it)->n_tokens > c.n_tokens || (*it)->pos_max > pos_next) {
+                                it = dst.prompt.checkpoints.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    }
+                }
+                if (!ok) {
+                    dst.mem.seq_rm(dst.id, -1, -1);
+                    dst.prompt_clear();
+                }
+            }
         } else {
             SLT_INF(dst, "attaching to slot %d: reusable %zu -> %zu tokens (common prefix %zu, prompt %d)\n",
                     donor->id, own, best, lcp_max, task.n_tokens());

@@ -84,10 +84,14 @@ public:
     llama_memory_recurrent * get_mem_recr() const;
 
 private:
+    // aragosta: sequence ids >= n_seq_rs hold attention KV only (no recurrent cell, no rollback snapshots)
+    bool attn_only(llama_seq_id seq_id) const { return seq_id >= (llama_seq_id) n_seq_rs; }
+
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+    const uint32_t n_seq_rs;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {

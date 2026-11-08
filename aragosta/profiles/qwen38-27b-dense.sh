@@ -9,19 +9,22 @@
 #   prompts stay resident (warm TTFT 3.8 s -> 0.4 s at 2.4k tokens) with greedy-identical output.
 # --sched-prefill-chunk 512: caps prompt tokens per step while someone decodes
 #   (max decode stall 2.8 s -> 0.9 s with a long prefill arriving mid-decode, -1.7% aggregate tok/s).
+# 100k context fits at 11.1 GB/GPU: prefix anchors hold attention KV only (recurrent state of an anchor lives in
+#   host checkpoints), so they cost no recurrent-state VRAM. -ub 1024 needs -c <= 65536.
 # Override: MODEL=/path/to.gguf PORT=8080 NCCL_LIB=/dir/with/libnccl.so.2, extra args are appended.
 cd "$(dirname "$0")/../.."
 MODEL=${MODEL:-/home/snorkelaar/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf}
 export LD_LIBRARY_PATH="${NCCL_LIB:-/home/snorkelaar/nccl/x/nvidia/nccl/lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export GGML_CUDA_ALLREDUCE=${AR_MODE:-hybrid}
+export GGML_CUDA_ALLREDUCE=${AR_MODE:-nccl}
 if ! ldd ./build-nccl/bin/libggml-cuda.so.0 | grep -q 'libnccl.so.2 => /'; then
   echo 'NCCL-linked CUDA backend required: see aragosta/README.md (Build)' >&2
   exit 1
 fi
 exec ./build-nccl/bin/llama-server \
   -m "$MODEL" --alias qwen3.8-27b \
-  --jinja -ngl 99 -fa on -sm tensor \
-  -c 65536 -np 2 --kv-unified -ctk q8_0 -ctv q8_0 -b 2048 -ub 1024 \
+  --jinja --reasoning-format deepseek --no-mmproj -ngl 99 -fa on -fit off -sm tensor -ts 1,1 -t 4 \
+  -c 100000 -np 2 --kv-unified -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 \
   --slot-attach --prefix-anchors 3 --sched-prefill-chunk 512 \
   --spec-type draft-mtp --spec-draft-n-max 3 \
+  --temp 1.0 --top-p 0.95 --top-k 20 \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8080}" "$@"

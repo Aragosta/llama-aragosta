@@ -16,7 +16,10 @@ AllReduce goes through host shared memory. Decode is ~29 ms/token against ~21 ms
 so ~8 ms/token is communication and launch latency. Removing it needs fewer or overlapped AllReduces
 inside `ggml-backend-meta.cpp`, not NCCL settings. `nsys` cannot import reports on this host (importer missing).
 
-## Hybrid AllReduce (`GGML_CUDA_ALLREDUCE=hybrid`, default in the profile)
+## Hybrid AllReduce (`GGML_CUDA_ALLREDUCE=hybrid`, opt-in, NOT safe)
+
+Reverted as default: two crashes in 3 runs, kernel log `NVRM: Xid 109, CTX SWITCH TIMEOUT` on GPU1 at the same times.
+The internal kernels busy-wait on the peer GPU and the GPU cannot preempt them. NCCL-only ran every test clean.
 
 Internal kernel AllReduce for messages under 1 MiB (decode, MTP verify), NCCL above (prefill). The internal
 crash was in its copy-engine path (messages of 1 MiB and up), which hybrid never uses.
@@ -40,6 +43,16 @@ large messages (801). CUDA graphs are already active (disabling them: tg 33.9 vs
 | n-max 2 | 33.3 | 57.6 |
 | n-max 4 | 31.9 | failed |
 | n-max 3, p-min 0.5 | 30.3 | 59.3 |
+
+## 100k context and prefix anchors (VRAM per GPU)
+
+| Build | recurrent state | loads at -c 100000 |
+|---|---|---|
+| anchors as full sequences (5 seqs x 4 rows) | 2993 MiB | no, out of memory |
+| anchors attention-only (2 slots x 4 rows) | 1197 MiB | yes, 11.0 GB used |
+
+Live check, NCCL, `-ub 512`: 34.4 tok/s at 1 user, 70.2 at 2, no errors. With speculation off the three anchor
+agents give output identical to a cold run; with MTP on, greedy output can differ by float noise (batch shapes differ).
 
 ## Server, MTP3 (earlier A/B)
 
