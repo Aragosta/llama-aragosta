@@ -15,7 +15,7 @@ based on upstream `f7591a6a0` (2026-11-07). Everything is opt-in; without the fl
 | Speculation | No new drafts while more than N slots generate (only useful for `-np` > 3) | `--spec-max-active N` | `update_slots()` |
 | Speculation | A refused recurrent-state rollback ends the request instead of aborting the server | always | `server-context.cpp` |
 | CUDA | sm86 MMVQ->MMQ crossover table, MoE MMVQ up to 16 tokens | `GGML_CUDA_MMVQ_MAX=0..32` | `ggml-cuda/mmvq.cu` |
-| CUDA | `GGML_CUDA_ALLREDUCE=nccl` makes NCCL mandatory: startup fails instead of silently using the internal AllReduce | env | `ggml-cuda.cu` |
+| CUDA | `GGML_CUDA_ALLREDUCE=hybrid` (profile default): internal kernel AllReduce below 1 MiB, NCCL above (`GGML_CUDA_AR_NCCL_MIN`). `nccl`/`hybrid` fail startup instead of silently falling back | env | `ggml-cuda.cu` |
 
 ## Run it
 

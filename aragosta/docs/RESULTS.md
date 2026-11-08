@@ -16,6 +16,31 @@ AllReduce goes through host shared memory. Decode is ~29 ms/token against ~21 ms
 so ~8 ms/token is communication and launch latency. Removing it needs fewer or overlapped AllReduces
 inside `ggml-backend-meta.cpp`, not NCCL settings. `nsys` cannot import reports on this host (importer missing).
 
+## Hybrid AllReduce (`GGML_CUDA_ALLREDUCE=hybrid`, default in the profile)
+
+Internal kernel AllReduce for messages under 1 MiB (decode, MTP verify), NCCL above (prefill). The internal
+crash was in its copy-engine path (messages of 1 MiB and up), which hybrid never uses.
+
+| Mode | pp2048 | tg128 |
+|---|---|---|
+| nccl | 843 | 34.7 |
+| hybrid | 844 | 35.8 (+3.3%) |
+
+Ceiling check (AllReduce skipped, wrong output, timing only): tg 37.9, pp 1199. So AllReduce costs ~6% of decode
+but ~30% of prefill; prefill is limited by host-memory copy bandwidth (10 MB per AllReduce, 128 per ubatch).
+Did not help prefill: `NCCL_SHM_USE_CUDA_MEMCPY`, `NCCL_MIN_NCHANNELS` 4/8, NTHREADS 512, internal kernel path for
+large messages (801). CUDA graphs are already active (disabling them: tg 33.9 vs 35.8).
+`-ub 2048` gives pp 864 (+2%) but runs out of VRAM at `-c 65536`.
+
+## MTP depth and draft confidence (server, 1 / 2 users, tok/s)
+
+| Setting | 1 user | 2 users |
+|---|---|---|
+| n-max 3 (kept) | 34.1 | 66.0 |
+| n-max 2 | 33.3 | 57.6 |
+| n-max 4 | 31.9 | failed |
+| n-max 3, p-min 0.5 | 30.3 | 59.3 |
+
 ## Server, MTP3 (earlier A/B)
 
 | Setup | 1 user | 2 users |
@@ -42,6 +67,6 @@ MTP3 vs MTP2 at 2 users: 64.9 vs 59.9 tok/s. NCCL vs internal AllReduce at 2 use
 
 ## Not done (needs a profiler or a larger change)
 
-- Overlap AllReduce with compute / fewer AllReduces per layer in `ggml-backend-meta.cpp`.
-- CUDA-graph capture of the NCCL decode step (NCCL supports capture, but several GPUs in one process can deadlock).
+- Overlap prefill AllReduce with compute: needs two micro-batches in flight, which the single-ubatch llama_context cannot do. Prefill upper bound +42%.
+- Real GPU P2P: `nvidia-smi topo -p2p r` says "Chipset not supported", BAR1 is 256 MiB.
 - A rank-per-process executor.
