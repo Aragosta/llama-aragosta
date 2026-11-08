@@ -1,40 +1,49 @@
 # Aragosta
 
-Serving-oriented changes to llama.cpp for multi-user, agentic workloads: many sessions sharing long
-tool/system prefixes, short decode bursts, tool-call round trips. Branch `aragosta`, based on upstream
-`f7591a6a0` (2026-11-07). Everything is opt-in; with no new flags the server behaves as upstream.
-
-Target hardware for the numbers here: 2x RTX 3060 12 GB (sm_86, PCIe, no NVLink), 8-core CPU, 30 GB RAM.
+Serving changes to llama.cpp for 1-3 users running coding agents and sub-agents on 2x RTX 3060 12 GB
+(sm_86, PCIe, no NVLink): long shared system/tool prefixes, short decode bursts, forks. Branch `aragosta`,
+based on upstream `f7591a6a0` (2026-11-07). Everything is opt-in; without the flags the server is upstream.
 
 ## What is in it
 
-| Area | Change | Flag / knob | Where |
-|------|--------|-------------|-------|
-| Prefix sharing | Cross-slot attach: a new task takes the longest shared prefix from any slot by sharing its KV cells (`seq_cp`); hybrid models attach at checkpoints. After [#30664](https://github.com/ggml-org/llama.cpp/discussions/30664). | `--slot-attach` (needs `--kv-unified`) | `tools/server/server-context.cpp` `slot_attach()` |
-| Prefix sharing | Divergence checkpoints: hybrid prompts checkpoint where they leave the best cached prompt, so later sessions resume exactly there | on with `--slot-attach` | same, `n_ckpt_divergence` |
-| Scheduling | Prefill token budget while any slot decodes (vLLM `long_prefill_token_threshold`); lifted when idle | `--sched-prefill-chunk N` | `update_slots()` |
-| Scheduling | Prompt processing in task-arrival (FCFS) order instead of slot index | always | `prefill_order()` |
-| Speculation | No new MTP/draft rounds while more than N slots generate (vLLM disables spec by batch size) | `--spec-max-active N` | `update_slots()` |
-| CUDA | sm86 (GA10x) MMVQ->MMQ crossover table for dense matmuls | automatic on sm86 | `ggml-cuda/mmvq.cu` |
-| CUDA | MoE MMVQ kernel past 8 tokens (tokens tiled over `gridDim.z`), sm86 table up to 16 | automatic on sm86 | `ggml-cuda/mmvq.cu` |
-| CUDA | Runtime override of both tables | `GGML_CUDA_MMVQ_MAX=0..32` | `ggml-cuda/mmvq.cu` |
+| Area | Change | Flag | Where |
+|------|--------|------|-------|
+| Prefix sharing | A new task takes the longest shared prefix from any slot by sharing KV cells (`seq_cp`); hybrid models attach at checkpoints, with a checkpoint at the divergence point | `--slot-attach` (needs `--kv-unified`) | `server-context.cpp` `slot_attach()` |
+| Prefix sharing | Persistent prefix anchors: KV of finished prompts is kept in extra sequences, independent of any slot. One anchor per agent/sub-agent prompt; a longer turn of the same prompt extends its anchor; LRU eviction | `--prefix-anchors N` (default 3) | `prefix_commit()`, `common_context_params_to_llama` |
+| Scheduling | Prompt tokens per step are capped while any slot decodes (bounds decode stalls) | `--sched-prefill-chunk N` | `update_slots()` |
+| Scheduling | Prefill in task-arrival order, not slot order | always | `prefill_order()` |
+| Speculation | No new drafts while more than N slots generate (only useful for `-np` > 3) | `--spec-max-active N` | `update_slots()` |
+| Speculation | A refused recurrent-state rollback ends the request instead of aborting the server | always | `server-context.cpp` |
+| CUDA | sm86 MMVQ->MMQ crossover table, MoE MMVQ up to 16 tokens | `GGML_CUDA_MMVQ_MAX=0..32` | `ggml-cuda/mmvq.cu` |
+| CUDA | `GGML_CUDA_ALLREDUCE=nccl` makes NCCL mandatory: startup fails instead of silently using the internal AllReduce | env | `ggml-cuda.cu` |
 
-## Tools
-
-- `bench/agent_load.py` — N concurrent agent sessions, shared tool prefix + volatile tail, growing history.
-  Reports TTFT p50/p95, inter-token gap p95, max decode stall, aggregate tok/s, prompt-cache hit %.
-- `bench/run_matrix.sh` — start a server profile, run `agent_load.py` at several concurrencies, save JSON.
-- `bench/attach_check.py` — greedy-output equality of an attached prompt vs a cold run vs same-slot reuse.
-- `tools/mmq_sweep.cpp` (`mmq-sweep`) + `tools/tune_mmq_crossover.py` — time MMVQ vs MMQ per quant type and
-  shape, derive crossover tables for the local GPU.
-
-## Reproduce
+## Run it
 
 ```bash
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build build -j --target llama-server mmq-sweep test-backend-ops
-python3 aragosta/tools/tune_mmq_crossover.py --device CUDA0 --nmax 32 --out aragosta/results/crossover.json
-GGML_CUDA_MMVQ_MAX=32 ./build/bin/test-backend-ops -o MUL_MAT_ID -b CUDA0
-SESSIONS="1 2 4" aragosta/bench/run_matrix.sh label ./build/bin/llama-server model.gguf -- -np 4 --kv-unified --slot-attach
+aragosta/profiles/qwen38-27b-dense.sh              # Qwen3.8-27B, serves on 127.0.0.1:8080
+PORT=8081 MODEL=/path/model.gguf aragosta/profiles/qwen38-27b-dense.sh --prefix-anchors 4
 ```
 
-Results: [docs/RESULTS.md](docs/RESULTS.md). Plan, critique and vLLM mapping: [docs/PLAN.md](docs/PLAN.md).
+On the server it runs as the user service `llama-aragosta` (`systemctl --user status|restart llama-aragosta`).
+
+## Build
+
+```bash
+cmake -S . -B build-nccl -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_CUDA_NCCL=ON \
+  -DNCCL_INCLUDE_DIR=/home/snorkelaar/nccl/x/nvidia/nccl/include \
+  -DNCCL_LIBRARY=/home/snorkelaar/nccl/x/nvidia/nccl/lib/libnccl.so.2
+cmake --build build-nccl -j 8 --target llama-server llama-bench
+ldd build-nccl/bin/libggml-cuda.so.0 | grep nccl     # must resolve to a path
+```
+
+`-DGGML_CUDA_NCCL=ON` alone is not enough: with the paths `NOTFOUND` it builds and silently falls back.
+
+## Measure
+
+- `bench/agent_load.py`, `bench/run_matrix.sh`: N agent sessions with a shared prefix; TTFT p50/p95, inter-token gap, stall, tok/s, cache hit %.
+- `bench/anchors_check.py URL K`: K distinct long prompts, parents, erase slots, children must hit the anchors with identical greedy output (server needs `--slot-save-path`).
+- `bench/attach_check.py`: attached prompt vs cold run vs same-slot reuse, greedy equality.
+- `bench/prefix_ab.py`, `bench/nccl_ab.sh`: short A/B traces.
+- `tools/mmq_sweep.cpp` + `tools/tune_mmq_crossover.py`: derive MMVQ/MMQ crossover tables for a GPU.
+
+Numbers and decisions: [docs/RESULTS.md](docs/RESULTS.md). NCCL notes and rationale: [docs/NCCL.md](docs/NCCL.md).
